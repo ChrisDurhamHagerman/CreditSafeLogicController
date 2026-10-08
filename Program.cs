@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.OleDb;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -10,6 +11,10 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web;
+using Microsoft.Office.Interop.Access;
+using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
+
 
 namespace CreditSafeController
 {
@@ -38,6 +43,8 @@ namespace CreditSafeController
         private static readonly string NsTokenSecret = "3983843dedb5eb237ab3eaf9efeca8c445934f7cdc58f6cd4cbc85efadbc73a6";
         private static readonly string NsCustomerRestletUrl = "https://290783.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=862&deploy=1";
         private static readonly string NsInvoiceRestletUrl = "https://290783.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=863&deploy=1";
+        private static readonly string NsTriggerImportRestletUrl = "https://290783.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script=864&deploy=1";
+
 
 
         private static int Main(string[] args)
@@ -125,13 +132,59 @@ namespace CreditSafeController
 
                 if (customerReady && invoiceReady)
                 {
-                    Log("Both Customer and Invoice CSVs are present. Running Access process...");
-                    RunProcessAndExport();  // runs 02-Process Everything → exports 09-Import to NetSuite Data
+                    Log("Both Customer and Invoice CSVs are present.");
+
+                    // ⭐⭐⭐ ADD THIS ⭐⭐⭐
+                    // Import CSVs into Access tables dbo_tc_customer and dbo_tc_invoice_dso
+                    try
+                    {
+                        CsvAccessImporter.ImportCreditSafeFiles(customerPath, invoicePath);
+                        Log("Imported CreditSafe CSVs into Access successfully.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"ERROR during Access import: {ex.Message}");
+                    }
+                    // ⭐⭐⭐ END ADD ⭐⭐⭐
+
+                    // After importing, run Access process + export for NetSuite
+                    Log("Running Access process...");
+                    RunProcessAndExport();
                 }
                 else
                 {
                     Log($"Skipping Access process. CustomerReady={customerReady}, InvoiceReady={invoiceReady}");
                 }
+
+                // ========================================================
+                // 7) Send CreditSafeImport.csv directly to NetSuite Saved Import
+                // ========================================================
+
+                string creditSafeCsv = Path.Combine(CreditSafeExportRoot, "CreditSafeImport.csv");
+
+                if (File.Exists(creditSafeCsv) && new FileInfo(creditSafeCsv).Length > 0)
+                {
+                    Log("Cleaning timestamps from CreditSafeImport.csv...");
+                    CleanCreditSafeExport(creditSafeCsv);
+
+                    Log("Sending CreditSafeImport.csv to NetSuite saved import...");
+
+                    bool importOk = TriggerNetSuiteCsvImport(creditSafeCsv).GetAwaiter().GetResult();
+
+                    if (importOk)
+                        Log("✔ NetSuite CSV import triggered successfully.");
+                    else
+                        Log("❌ NetSuite CSV import failed.");
+                }
+                else
+                {
+                    Log("❌ CreditSafeImport.csv not found or empty. Cannot send to NetSuite.");
+                }
+
+
+
+
+
 
                 Log("CreditSafeController complete.");
                 return 0;
@@ -234,7 +287,7 @@ Extended Properties=""Excel 12.0 Xml;HDR=Yes;IMEX=1"";";
                     if (obj is string s)
                     {
                         var cleaned = CleanString(s);
-                        if (!ReferenceEquals(s, cleaned))
+                        if (!string.Equals(s, cleaned, StringComparison.Ordinal))
                         {
                             row[col] = cleaned;
                             changed++;
@@ -659,34 +712,177 @@ VALUES
 
         private static void RunProcessAndExport()
         {
-            // 1) Run the process query (action query) inside Access: [02-Process Everything]
-            //    If it's a saved SELECT query, the EXECUTE will be a no-op; that's fine.
+            Microsoft.Office.Interop.Access.Application accessApp = null;
+
             try
             {
-                using (var conn = new OleDbConnection(ConnStr))
+                Log("Running Access macro: 02-Process Everything");
+
+                accessApp = new Microsoft.Office.Interop.Access.Application();
+                accessApp.OpenCurrentDatabase(DbPath, false);
+
+                // Run macro
+                accessApp.DoCmd.RunMacro("02-Process Everything");
+                Log("Macro completed successfully.");
+
+                // Export the output query using Access (NOT OleDb Text driver)
+                ExportQueryToCsv_AccessCom(
+                    accessApp: accessApp,
+                    queryOrTableName: "09-Import to NetSuite Data",  // no brackets here
+                    exportDir: @"C:\ADSK-Automation\CreditSafe Imports",
+                    exportFileName: "CreditSafeImport.csv"
+                );
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR running Access macro/export: {ex.Message}");
+                if (ex.InnerException != null)
+                    Log($"   ⤷ Inner: {ex.InnerException.Message}");
+            }
+            finally
+            {
+                try
                 {
-                    conn.Open();
-                    using (var cmd = new OleDbCommand("EXECUTE [02-Process Everything]", conn))
+                    if (accessApp != null)
                     {
-                        var affected = cmd.ExecuteNonQuery();
-                        Log($"Executed process query [02-Process Everything]. Rows affected: {affected}");
+                        accessApp.CloseCurrentDatabase();
+                        accessApp.Quit();
+                        Marshal.ReleaseComObject(accessApp);
+                        accessApp = null;
                     }
+                }
+                catch { }
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+
+        }
+
+        /// <summary>
+        /// Exports a saved Access query (or table) to CSV using Access COM (DoCmd.TransferText),
+        /// which avoids the fragile OleDb Text/ISAM SELECT INTO behavior.
+        /// Archives old export first (same behavior as your prior method).
+        /// </summary>
+        private static void ExportQueryToCsv_AccessCom(
+            Microsoft.Office.Interop.Access.Application accessApp,
+            string queryOrTableName,
+            string exportDir,
+            string exportFileName)
+        {
+            try
+            {
+                SafeEnsureDir(exportDir);
+                SafeEnsureDir(CreditSafeOldExports);
+
+                var exportPath = Path.Combine(exportDir, exportFileName);
+
+                // Archive old file if present
+                if (File.Exists(exportPath))
+                {
+                    var archivedPath = Path.Combine(
+                        CreditSafeOldExports,
+                        $"{Path.GetFileNameWithoutExtension(exportFileName)}_{DateTime.Now:yyyyMMdd_HHmmss}.csv"
+                    );
+
+                    try
+                    {
+                        File.Move(exportPath, archivedPath);
+                        Log($"Archived previous export to {archivedPath}");
+                    }
+                    catch (Exception exMove)
+                    {
+                        Log($"WARN: Could not move old export (will try delete). {exMove.Message}");
+                        File.Delete(exportPath);
+                        Log("Deleted existing export to allow new write.");
+                    }
+                }
+
+                // Export using Access engine
+                Log($"Exporting '{queryOrTableName}' -> {exportPath}");
+
+                accessApp.DoCmd.TransferText(
+                    Microsoft.Office.Interop.Access.AcTextTransferType.acExportDelim,
+                    Type.Missing,              // export spec (none)
+                    queryOrTableName,          // saved query name OR table name
+                    exportPath,                // output file
+                    true                       // include headers
+                );
+
+                if (!File.Exists(exportPath))
+                    throw new IOException($"Expected export file not found after export: {exportPath}");
+
+                var len = new FileInfo(exportPath).Length;
+                Log($"Exported {queryOrTableName} -> {exportPath} ({len:n0} bytes).");
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR exporting query to CSV (Access COM): {ex.Message}");
+                if (ex.InnerException != null)
+                    Log($"   ⤷ Inner: {ex.InnerException.Message}");
+            }
+        }
+
+
+
+        private static async Task<bool> TriggerNetSuiteCsvImport(string csvFilePath)
+        {
+            try
+            {
+                if (!File.Exists(csvFilePath))
+                {
+                    Log("❌ CreditSafeImport.csv not found.");
+                    return false;
+                }
+
+                string csvText = File.ReadAllText(csvFilePath, Encoding.UTF8);
+
+                string url = NsTriggerImportRestletUrl;  // script=864
+
+                string nonce, ts, baseString, paramString;
+                string auth = BuildTbaAuthHeader_HS256(
+                    "POST",
+                    url,
+                    NsAccount,
+                    NsConsumerKey,
+                    NsConsumerSecret,
+                    NsTokenId,
+                    NsTokenSecret,
+                    out baseString,
+                    out paramString,
+                    out nonce,
+                    out ts
+                );
+
+                Log($"Triggering saved import with RESTlet 864...");
+                Log($"TBA: nonce={nonce}, ts={ts}");
+
+                var json = "{ \"csv\": \"" + EscapeJson(csvText) + "\" }";
+
+                using (var http = new HttpClient())
+                {
+                    var req = new HttpRequestMessage(HttpMethod.Post, url);
+                    req.Headers.Add("Authorization", auth);
+                    req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    var res = await http.SendAsync(req);
+                    var body = await res.Content.ReadAsStringAsync();
+
+                    Log($"Import trigger HTTP {(int)res.StatusCode}: {res.ReasonPhrase}");
+                    Log($"Response: {body}");
+
+                    return res.IsSuccessStatusCode;
                 }
             }
             catch (Exception ex)
             {
-                Log($"WARN: Could not EXECUTE [02-Process Everything]. {ex.Message}");
-                Log("If this is a macro (not a saved query), use AccessMacroRunner.exe to run it.");
-                // We continue either way; the export may still work if data is already prepared.
+                Log($"❌ ERROR TriggerNetSuiteCsvImport: {ex.Message}");
+                return false;
             }
-
-            // 2) Export the output query [09-Import to NetSuite Data] to CSV via Text driver
-            ExportQueryToCsv(
-                queryName: "[09-Import to NetSuite Data]",
-                exportDir: @"C:\ADSK-Automation\CreditSafe Imports",
-                exportFileName: "CreditSafeImport.csv"
-            );
         }
+
+
+
 
         /// <summary>
         /// Exports a SELECTable table/query from Access to a CSV using the ACE Text driver.
@@ -773,6 +969,95 @@ FROM {queryName}";
                 Log($"Failed to ensure directory '{path}': {ex.Message}");
             }
         }
+
+        private static string EscapeJson(string s)
+        {
+            if (string.IsNullOrEmpty(s))
+                return "";
+
+            return s
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n");
+        }
+
+        private static void CleanCreditSafeExport(string csvPath)
+        {
+            try
+            {
+                if (!File.Exists(csvPath))
+                {
+                    Log($"CleanCreditSafeExport: file not found: {csvPath}");
+                    return;
+                }
+
+                var originalText = File.ReadAllText(csvPath);
+
+                // Match things like:
+                //  11/17/2025 14:57:01
+                //  1/7/2025 9:05:03
+                // and replace with just the date part:
+                //  11/17/2025
+                var pattern = @"(\d{1,2}/\d{1,2}/\d{4})\s+\d{1,2}:\d{2}:\d{2}";
+                var cleanedText = Regex.Replace(originalText, pattern, "$1");
+
+                File.WriteAllText(csvPath, cleanedText, Encoding.UTF8);
+
+                Log("CleanCreditSafeExport: stripped time component from date/time values in CSV.");
+            }
+            catch (Exception ex)
+            {
+                Log($"CleanCreditSafeExport ERROR: {ex.Message}");
+            }
+        }
+
+
+
+        private static List<string> ParseCsvLine(string line)
+        {
+            var result = new List<string>();
+            bool inQuotes = false;
+            var cur = new StringBuilder();
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+
+                if (c == '"')
+                {
+                    inQuotes = !inQuotes;
+                    continue;
+                }
+
+                if (c == ',' && !inQuotes)
+                {
+                    result.Add(cur.ToString());
+                    cur.Clear();
+                }
+                else
+                {
+                    cur.Append(c);
+                }
+            }
+
+            result.Add(cur.ToString());
+            return result;
+        }
+
+        private static string RebuildCsvLine(List<string> parts)
+        {
+            return string.Join(",", parts.Select(v =>
+            {
+                if (v.Contains(",") || v.Contains("\""))
+                    return "\"" + v.Replace("\"", "\"\"") + "\"";
+                return v;
+            }));
+        }
+
+
+
+
 
         private static void Log(string message)
         {
