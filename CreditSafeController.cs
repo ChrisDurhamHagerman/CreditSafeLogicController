@@ -21,34 +21,50 @@ namespace CreditSafeController
             {
                 Log("=== Starting CreditSafe CSV import process ===");
 
-                if (File.Exists(customerCsv))
-                {
-                    Log($"Customer CSV detected: {customerCsv}");
-                    ImportCustomerCsvToAccess(customerCsv);
-                }
-                else
-                    Log("⚠️ Customer CSV not found, skipping import.");
+                if (!File.Exists(customerCsv))
+                    throw new FileNotFoundException("Customer CSV was not found.", customerCsv);
+                if (!File.Exists(invoiceCsv))
+                    throw new FileNotFoundException("Invoice CSV was not found.", invoiceCsv);
 
-                if (File.Exists(invoiceCsv))
+                using (var connection = new OleDbConnection(ConnStr))
                 {
-                    Log($"Invoice CSV detected: {invoiceCsv}");
-                    ImportInvoiceCsvToAccess(invoiceCsv);
+                    connection.Open();
+                    using (var transaction = connection.BeginTransaction())
+                    {
+                        try
+                        {
+                            Log($"Customer CSV detected: {customerCsv}");
+                            ImportCustomerCsvToAccess(customerCsv, connection, transaction);
+
+                            Log($"Invoice CSV detected: {invoiceCsv}");
+                            ImportInvoiceCsvToAccess(invoiceCsv, connection, transaction);
+
+                            transaction.Commit();
+                        }
+                        catch
+                        {
+                            try { transaction.Rollback(); } catch { }
+                            throw;
+                        }
+                    }
                 }
-                else
-                    Log("⚠️ Invoice CSV not found, skipping import.");
 
                 Log("=== CreditSafe CSV import complete ===");
             }
             catch (Exception ex)
             {
                 Log($"❌ ImportCreditSafeFiles ERROR: {ex}");
+                throw;
             }
         }
 
         // --------------------------------------------------------------------
         // CUSTOMER CSV IMPORT
         // --------------------------------------------------------------------
-        private static void ImportCustomerCsvToAccess(string csvPath)
+        private static void ImportCustomerCsvToAccess(
+            string csvPath,
+            OleDbConnection connection,
+            OleDbTransaction transaction)
         {
             try
             {
@@ -57,24 +73,20 @@ namespace CreditSafeController
                 var lines = File.ReadAllLines(csvPath);
                 if (lines.Length <= 1)
                 {
-                    Log("No rows to import from Customer CSV.");
-                    return;
+                    throw new InvalidDataException("Customer CSV contains no data rows.");
                 }
 
                 var headers = lines[0].Split(',').Select(h => h.Trim('"')).ToArray();
 
-                using (var conn = new OleDbConnection(ConnStr))
-                {
-                    conn.Open();
-
-                    // clear old rows
-                    new OleDbCommand("DELETE FROM dbo_tc_customer", conn).ExecuteNonQuery();
+                // clear old rows within the shared customer/invoice transaction
+                new OleDbCommand("DELETE FROM dbo_tc_customer", connection, transaction).ExecuteNonQuery();
                     Log("Cleared existing rows in dbo_tc_customer.");
 
                     for (int i = 1; i < lines.Length; i++)
                     {
                         var cols = ParseCsvLine(lines[i]);
-                        if (cols.Length < headers.Length) continue;
+                        if (cols.Length < headers.Length)
+                            throw new InvalidDataException("Customer CSV row " + (i + 1) + " has fewer fields than its header.");
 
                         string sql = @"
 INSERT INTO dbo_tc_customer
@@ -111,7 +123,7 @@ VALUES
 )";
 
 
-                        using (var cmd = new OleDbCommand(sql, conn))
+                        using (var cmd = new OleDbCommand(sql, connection, transaction))
                         {
                             cmd.Parameters.AddWithValue("@InternalID", GetValue(cols, headers, "InternalID"));
                             cmd.Parameters.AddWithValue("@Customer", GetValue(cols, headers, "Customer"));
@@ -131,18 +143,21 @@ VALUES
                     }
 
                     Log($"✅ Imported {lines.Length - 1} rows into dbo_tc_customer.");
-                }
             }
             catch (Exception ex)
             {
                 Log($"❌ ImportCustomerCsvToAccess ERROR: {ex}");
+                throw;
             }
         }
 
         // --------------------------------------------------------------------
         // INVOICE CSV IMPORT
         // --------------------------------------------------------------------
-        private static void ImportInvoiceCsvToAccess(string csvPath)
+        private static void ImportInvoiceCsvToAccess(
+            string csvPath,
+            OleDbConnection connection,
+            OleDbTransaction transaction)
         {
             try
             {
@@ -151,22 +166,19 @@ VALUES
                 var lines = File.ReadAllLines(csvPath);
                 if (lines.Length <= 1)
                 {
-                    Log("No rows to import from Invoice CSV.");
-                    return;
+                    throw new InvalidDataException("Invoice CSV contains no data rows.");
                 }
 
                 var headers = lines[0].Split(',').Select(h => h.Trim('"')).ToArray();
 
-                using (var conn = new OleDbConnection(ConnStr))
-                {
-                    conn.Open();
-                    new OleDbCommand("DELETE FROM dbo_tc_invoice_dso", conn).ExecuteNonQuery();
+                new OleDbCommand("DELETE FROM dbo_tc_invoice_dso", connection, transaction).ExecuteNonQuery();
                     Log("Cleared existing rows in dbo_tc_invoice_dso.");
 
                     for (int i = 1; i < lines.Length; i++)
                     {
                         var cols = ParseCsvLine(lines[i]);
-                        if (cols.Length < headers.Length) continue;
+                        if (cols.Length < headers.Length)
+                            throw new InvalidDataException("Invoice CSV row " + (i + 1) + " has fewer fields than its header.");
 
                         string sql = @"
 INSERT INTO dbo_tc_invoice_dso
@@ -207,7 +219,7 @@ VALUES
 )";
 
 
-                        using (var cmd = new OleDbCommand(sql, conn))
+                        using (var cmd = new OleDbCommand(sql, connection, transaction))
                         {
                             cmd.Parameters.AddWithValue("@InternalID", GetValue(cols, headers, "InternalID"));
                             cmd.Parameters.AddWithValue("@Customer", GetValue(cols, headers, "Customer"));
@@ -229,11 +241,11 @@ VALUES
                     }
 
                     Log($"✅ Imported {lines.Length - 1} rows into dbo_tc_invoice_dso.");
-                }
             }
             catch (Exception ex)
             {
                 Log($"❌ ImportInvoiceCsvToAccess ERROR: {ex}");
+                throw;
             }
         }
 

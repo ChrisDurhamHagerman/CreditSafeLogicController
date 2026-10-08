@@ -89,37 +89,23 @@ namespace CreditSafeController
                 InsertIntoAccess(excelData);
 
                 // ========================================================
-                // 5) Fetch Customer and Invoice CSVs sequentially
+                // 5) Fetch and validate both CSVs before replacing the previous import files.
                 // ========================================================
                 Log($"Calling paged RESTlet (customer): {NsCustomerRestletUrl} | realm={NsAccount}");
                 var customerCsv = CallPagedCsvRestletAsync(NsCustomerRestletUrl, "customer").GetAwaiter().GetResult();
-
-                if (string.IsNullOrEmpty(customerCsv))
-                {
-                    Log("Customer fetch failed (null/empty). Skipping CustomerSync.csv write.");
-                }
-                else
-                {
-                    SafeEnsureDir(ImportRoot);
-                    SafeEnsureDir(ArchiveRoot);
-                    SaveWithArchive("CustomerSync.csv", customerCsv);
-                    Log("Saved CustomerSync.csv to NetSuiteImports.");
-                }
+                if (string.IsNullOrWhiteSpace(customerCsv))
+                    throw new InvalidDataException("Customer export returned no CSV data; preserving the previous import files.");
 
                 Log($"Calling paged RESTlet (invoice): {NsInvoiceRestletUrl} | realm={NsAccount}");
                 var invoiceCsv = CallPagedCsvRestletAsync(NsInvoiceRestletUrl, "invoice").GetAwaiter().GetResult();
+                if (string.IsNullOrWhiteSpace(invoiceCsv))
+                    throw new InvalidDataException("Invoice export returned no CSV data; preserving the previous import files.");
 
-                if (string.IsNullOrEmpty(invoiceCsv))
-                {
-                    Log("Invoice fetch failed (null/empty). Skipping InvoiceDSOSync.csv write.");
-                }
-                else
-                {
-                    SafeEnsureDir(ImportRoot);
-                    SafeEnsureDir(ArchiveRoot);
-                    SaveWithArchive("InvoiceDSOSync.csv", invoiceCsv);
-                    Log("Saved InvoiceDSOSync.csv to NetSuiteImports.");
-                }
+                SafeEnsureDir(ImportRoot);
+                SafeEnsureDir(ArchiveRoot);
+                SaveWithArchive("CustomerSync.csv", customerCsv);
+                SaveWithArchive("InvoiceDSOSync.csv", invoiceCsv);
+                Log("Saved both current NetSuite CreditSafe export files.");
 
                 // ========================================================
                 // 6) Ensure both CSVs exist before running Access process
@@ -134,18 +120,8 @@ namespace CreditSafeController
                 {
                     Log("Both Customer and Invoice CSVs are present.");
 
-                    // ⭐⭐⭐ ADD THIS ⭐⭐⭐
-                    // Import CSVs into Access tables dbo_tc_customer and dbo_tc_invoice_dso
-                    try
-                    {
-                        CsvAccessImporter.ImportCreditSafeFiles(customerPath, invoicePath);
-                        Log("Imported CreditSafe CSVs into Access successfully.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"ERROR during Access import: {ex.Message}");
-                    }
-                    // ⭐⭐⭐ END ADD ⭐⭐⭐
+                    CsvAccessImporter.ImportCreditSafeFiles(customerPath, invoicePath);
+                    Log("Imported CreditSafe CSVs into Access successfully.");
 
                     // After importing, run Access process + export for NetSuite
                     Log("Running Access process...");
@@ -153,7 +129,9 @@ namespace CreditSafeController
                 }
                 else
                 {
-                    Log($"Skipping Access process. CustomerReady={customerReady}, InvoiceReady={invoiceReady}");
+                    throw new InvalidDataException(
+                        "One or both required CreditSafe import files are missing or empty. "
+                        + "CustomerReady=" + customerReady + ", InvoiceReady=" + invoiceReady + ".");
                 }
 
                 // ========================================================
@@ -161,6 +139,7 @@ namespace CreditSafeController
                 // ========================================================
 
                 string creditSafeCsv = Path.Combine(CreditSafeExportRoot, "CreditSafeImport.csv");
+                bool importOk;
 
                 if (File.Exists(creditSafeCsv) && new FileInfo(creditSafeCsv).Length > 0)
                 {
@@ -169,7 +148,7 @@ namespace CreditSafeController
 
                     Log("Sending CreditSafeImport.csv to NetSuite saved import...");
 
-                    bool importOk = TriggerNetSuiteCsvImport(creditSafeCsv).GetAwaiter().GetResult();
+                    importOk = TriggerNetSuiteCsvImport(creditSafeCsv).GetAwaiter().GetResult();
 
                     if (importOk)
                         Log("✔ NetSuite CSV import triggered successfully.");
@@ -179,12 +158,16 @@ namespace CreditSafeController
                 else
                 {
                     Log("❌ CreditSafeImport.csv not found or empty. Cannot send to NetSuite.");
+                    importOk = false;
                 }
 
 
 
 
 
+
+                if (!importOk)
+                    throw new InvalidOperationException("NetSuite rejected the CreditSafe saved import request.");
 
                 Log("CreditSafeController complete.");
                 return 0;
@@ -738,6 +721,7 @@ VALUES
                 Log($"ERROR running Access macro/export: {ex.Message}");
                 if (ex.InnerException != null)
                     Log($"   ⤷ Inner: {ex.InnerException.Message}");
+                throw;
             }
             finally
             {
@@ -820,6 +804,7 @@ VALUES
                 Log($"ERROR exporting query to CSV (Access COM): {ex.Message}");
                 if (ex.InnerException != null)
                     Log($"   ⤷ Inner: {ex.InnerException.Message}");
+                throw;
             }
         }
 
@@ -1009,6 +994,7 @@ FROM {queryName}";
             catch (Exception ex)
             {
                 Log($"CleanCreditSafeExport ERROR: {ex.Message}");
+                throw;
             }
         }
 
