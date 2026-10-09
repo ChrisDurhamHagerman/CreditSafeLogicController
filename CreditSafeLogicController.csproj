@@ -127,6 +127,7 @@
     <None Include="App.config" />
     <None Include="appsettings.json" />
     <None Include="packages.config" />
+    <None Include="Properties\PublishProfiles\ServerRelease.pubxml" />
   </ItemGroup>
   <ItemGroup>
     <COMReference Include="ADODB">
@@ -197,4 +198,9 @@
     </BootstrapperPackage>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <PropertyGroup Condition="'$(PublishProfile)' != ''">
+    <CreditSafePublishProfile Condition="Exists('$(MSBuildProjectDirectory)\Properties\PublishProfiles\$(PublishProfile).pubxml')">$(MSBuildProjectDirectory)\Properties\PublishProfiles\$(PublishProfile).pubxml</CreditSafePublishProfile>
+    <CreditSafePublishProfile Condition="'$(CreditSafePublishProfile)' == '' And Exists('$(PublishProfile)')">$(PublishProfile)</CreditSafePublishProfile>
+  </PropertyGroup>
+  <Import Project="$(CreditSafePublishProfile)" Condition="'$(CreditSafePublishProfile)' != ''" />
 </Project>
